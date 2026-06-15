@@ -1,0 +1,993 @@
+const db = require("../../database/sql");
+
+/**
+ * Save a report
+ * @param {Object} req - Request object
+ * @param {Object} res - Response object
+ */
+const saveReport = async (req, res) => {
+  try {
+    const {
+      client_id,
+      template_name,
+      colors,
+      content,
+      status,
+      user_id: requestUserId,
+      id: bodyId, // Allow ID to be passed in the body
+      table, // Allow table to be specified in the body
+    } = req.body;
+
+    // Check if this is an update request (PUT) by checking for ID in URL params
+    const reportId = req.params.id || bodyId;
+    const isUpdate = !!reportId;
+
+    // Use user_id from request payload if provided, otherwise fall back to JWT token
+    const user_id = requestUserId || req.user?.id || null;
+
+    console.log(
+      "User ID for report creation/update:",
+      user_id,
+      "Request payload ID:",
+      requestUserId,
+      "JWT token ID:",
+      req.user?.id
+    );
+
+    console.log(
+      "Report operation:",
+      isUpdate ? "UPDATE" : "CREATE",
+      "Report ID:",
+      reportId,
+      "Table:",
+      table
+    );
+
+    if (!client_id || !template_name) {
+      return res.status(400).json({
+        error: "Client ID and template name are required",
+      });
+    }
+
+    console.log("Attempting to save report with client_id:", client_id);
+    console.log("Report template name:", template_name);
+
+    // Default status to 'draft' if not provided
+    const reportStatus = status || "draft";
+
+    // If updating and table is provided in the query, use it
+    const tableFromQuery = req.query.table;
+    const clientReportsTableOverride = tableFromQuery || table;
+
+    // Get a connection from the pool
+    const connection = await db.getConnection();
+
+    try {
+      // First, get the client name for the table name
+      console.log("Executing client lookup query for ID:", client_id);
+
+      // Try to normalize UUID format if needed
+      let normalizedClientId = client_id;
+      if (typeof client_id === "string" && client_id.includes("-")) {
+        // Keep UUID format as is for lookup
+        normalizedClientId = client_id;
+      }
+
+      const [clientResult] = await connection.query(
+        "SELECT id, name FROM clients WHERE id = ?",
+        [normalizedClientId]
+      );
+
+      console.log("Client lookup result:", clientResult);
+
+      if (clientResult.length === 0) {
+        // Try alternative lookup if using UUID string
+        console.log(
+          "Client not found with primary lookup, trying alternative lookup"
+        );
+        const [altClientResult] = await connection.query(
+          "SELECT id, name FROM clients WHERE uuid = ?",
+          [client_id]
+        );
+
+        console.log("Alternative client lookup result:", altClientResult);
+
+        if (altClientResult.length === 0) {
+          return res.status(404).json({
+            error: "Client not found. Tried with ID: " + client_id,
+          });
+        }
+
+        // Use client from alternative lookup
+        clientResult[0] = altClientResult[0];
+      }
+
+      // Format client name to be used in table name (remove spaces, special chars)
+      const clientName = clientResult[0].name
+        .replace(/\s+/g, "_") // Replace spaces with underscores
+        .replace(/[^a-zA-Z0-9_]/g, "") // Remove special characters
+        .toLowerCase();
+
+      // Define the client-specific reports table name
+      // If directly updating with a specific table, use that instead
+      const clientReportsTable =
+        clientReportsTableOverride || `${clientName}_reports`;
+      console.log("Using client table name:", clientReportsTable);
+
+      // Extract primary field information from the content
+      let primaryFieldName = "branch_code"; // Default to branch_code
+      let primaryFieldValue = null;
+
+      // Check if content has a specific primaryField object (new format)
+      if (content && typeof content === "object" && content.primaryField) {
+        primaryFieldName = content.primaryField.name;
+        primaryFieldValue = content.primaryField.value;
+        console.log(
+          `Using primaryField from content: ${primaryFieldName} = ${primaryFieldValue}`
+        );
+      }
+      // Fallback to the old method if primaryField is not directly available
+      else if (
+        content &&
+        typeof content === "object" &&
+        content.primaryIdentifierField &&
+        content.selectedFieldValues
+      ) {
+        primaryFieldName = content.primaryIdentifierField;
+
+        // Get the value for the primary field
+        const primaryFieldObj = content.selectedFieldValues[primaryFieldName];
+        if (primaryFieldObj) {
+          // If it's an object with value property (from dropdown)
+          if (typeof primaryFieldObj === "object" && primaryFieldObj.value) {
+            primaryFieldValue = primaryFieldObj.value;
+          } else if (
+            typeof primaryFieldObj === "object" &&
+            primaryFieldObj.name
+          ) {
+            primaryFieldValue = primaryFieldObj.name;
+          } else {
+            primaryFieldValue = primaryFieldObj;
+          }
+        }
+
+        console.log(
+          `Using dynamic primary field: ${primaryFieldName} = ${primaryFieldValue}`
+        );
+      } else {
+        console.log(
+          "No primary field defined in content, using default primary field name"
+        );
+      }
+
+      // If this is a direct update to a specific report ID (PUT request)
+      if (isUpdate && reportId) {
+        // Check if the table exists
+        const [tableExists] = await connection.query(
+          "SELECT COUNT(*) as count FROM information_schema.tables WHERE table_schema = DATABASE() AND table_name = ?",
+          [clientReportsTable]
+        );
+
+        if (tableExists[0].count === 0) {
+          return res.status(404).json({
+            error: `Table ${clientReportsTable} does not exist`,
+          });
+        }
+
+        // Check if the report exists in the table
+        const [reportExists] = await connection.query(
+          `SELECT id FROM ${clientReportsTable} WHERE id = ?`,
+          [reportId]
+        );
+
+        if (reportExists.length === 0) {
+          return res.status(404).json({
+            error: `Report with ID ${reportId} not found in table ${clientReportsTable}`,
+          });
+        }
+
+        // Update the existing report
+        console.log(
+          `Directly updating report with ID: ${reportId} in table: ${clientReportsTable}`
+        );
+        await connection.query(
+          `UPDATE ${clientReportsTable} 
+           SET primary_field_name = ?, primary_field_value = ?, colors = ?, content = ?, status = ?, updated_by = ?, updated_at = NOW(), template_name = ? 
+           WHERE id = ?`,
+          [
+            primaryFieldName,
+            primaryFieldValue,
+            JSON.stringify(colors || {}),
+            JSON.stringify(content || {}),
+            reportStatus,
+            user_id,
+            template_name,
+            reportId,
+          ]
+        );
+
+        return res.status(200).json({
+          success: true,
+          message: `Report with ID ${reportId} updated successfully in ${clientReportsTable}`,
+          data: {
+            id: reportId,
+            table: clientReportsTable,
+            primary_field: {
+              name: primaryFieldName,
+              value: primaryFieldValue,
+            },
+          },
+        });
+      }
+
+      // Continue with normal flow for non-direct updates...
+      // Check if the client-specific table exists
+      const [tableExists] = await connection.query(
+        "SELECT COUNT(*) as count FROM information_schema.tables WHERE table_schema = DATABASE() AND table_name = ?",
+        [clientReportsTable]
+      );
+
+      if (tableExists[0].count === 0) {
+        console.log(`Creating new table for client: ${clientReportsTable}`);
+
+        // Create the client-specific reports table with dynamic primary field
+        await connection.query(`
+          CREATE TABLE ${clientReportsTable} (
+            id INT AUTO_INCREMENT PRIMARY KEY,
+            client_id VARCHAR(255) NOT NULL,
+            template_name VARCHAR(255) NOT NULL,
+            primary_field_name VARCHAR(100) NOT NULL,
+            primary_field_value VARCHAR(255),
+            colors JSON,
+            content JSON,
+            status VARCHAR(50) DEFAULT 'draft',
+            created_by INT DEFAULT NULL,
+            updated_by INT DEFAULT NULL,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP
+          )
+        `);
+      } else {
+        // Check if the primary_field_name column exists
+        const [checkPrimaryFieldName] = await connection.query(
+          `
+          SELECT COUNT(*) as count 
+          FROM information_schema.columns 
+          WHERE 
+            table_schema = DATABASE() 
+            AND table_name = ? 
+            AND column_name = 'primary_field_name'
+        `,
+          [clientReportsTable]
+        );
+
+        // Check if the primary_field_value column exists
+        const [checkPrimaryFieldValue] = await connection.query(
+          `
+          SELECT COUNT(*) as count 
+          FROM information_schema.columns 
+          WHERE 
+            table_schema = DATABASE() 
+            AND table_name = ? 
+            AND column_name = 'primary_field_value'
+        `,
+          [clientReportsTable]
+        );
+
+        // Add primary_field_name column if it doesn't exist
+        if (checkPrimaryFieldName[0].count === 0) {
+          await connection.query(`
+            ALTER TABLE ${clientReportsTable}
+            ADD COLUMN primary_field_name VARCHAR(100) NOT NULL DEFAULT 'branch_code'
+          `);
+        }
+
+        // Add primary_field_value column if it doesn't exist
+        if (checkPrimaryFieldValue[0].count === 0) {
+          await connection.query(`
+            ALTER TABLE ${clientReportsTable}
+            ADD COLUMN primary_field_value VARCHAR(255)
+          `);
+        }
+
+        // Check if branch_code column exists and copy values if needed
+        const [branchCodeCheck] = await connection.query(
+          `
+          SELECT COUNT(*) as count 
+          FROM information_schema.columns 
+          WHERE 
+            table_schema = DATABASE() 
+            AND table_name = ? 
+            AND column_name = 'branch_code'
+        `,
+          [clientReportsTable]
+        );
+
+        // If branch_code exists, copy values to primary_field_value for backward compatibility
+        if (branchCodeCheck[0].count > 0) {
+          await connection.query(`
+            UPDATE ${clientReportsTable}
+            SET primary_field_value = branch_code
+            WHERE primary_field_value IS NULL AND branch_code IS NOT NULL
+          `);
+        }
+      }
+
+      // First check if a report with the exact same template name already exists
+      const [existingByName] = await connection.query(
+        `SELECT id FROM ${clientReportsTable} WHERE client_id = ? AND template_name = ?`,
+        [client_id, template_name]
+      );
+
+      // If this is a direct update with ID specified (PUT request), update the existing report
+      if (isUpdate && reportId) {
+        // This case is already handled above
+        // Just left here for clarity of logic flow
+      }
+      // For regular POST requests (new reports)
+      else {
+        // Check for existing reports with the same primary field value
+        if (primaryFieldValue) {
+          // Get all reports with the same primary field name and value (or similar with -1, -2 suffixes)
+          const [similarReports] = await connection.query(
+            `SELECT primary_field_value FROM ${clientReportsTable} 
+             WHERE client_id = ? AND primary_field_name = ? AND (primary_field_value = ? OR primary_field_value LIKE ?)`,
+            [
+              client_id,
+              primaryFieldName,
+              primaryFieldValue,
+              `${primaryFieldValue}-%`,
+            ]
+          );
+
+          // If there are similar reports, always add a suffix instead of updating
+          if (similarReports.length > 0) {
+            console.log(
+              `Found ${similarReports.length} similar reports with the primary field ${primaryFieldName}`
+            );
+
+            // Get the highest suffix number
+            let maxSuffix = 0;
+            let basePrimaryValue = primaryFieldValue;
+            let hasSuffix = false;
+
+            similarReports.forEach((report) => {
+              // Check if this exact value already exists (without suffix)
+              if (report.primary_field_value === primaryFieldValue) {
+                hasSuffix = true; // Mark that we need a suffix
+              }
+
+              // Handle values with dash and number suffix like "ABC-1", "ABC-2"
+              if (report.primary_field_value.includes("-")) {
+                const parts = report.primary_field_value.split("-");
+                const lastPart = parts[parts.length - 1];
+                const suffix = parseInt(lastPart);
+
+                // If the base value matches and the suffix is a number
+                if (
+                  !isNaN(suffix) &&
+                  report.primary_field_value.startsWith(`${basePrimaryValue}-`)
+                ) {
+                  if (suffix > maxSuffix) {
+                    maxSuffix = suffix;
+                  }
+                }
+              }
+            });
+
+            // If an exact match exists or we have suffixed versions, add/increment suffix
+            if (hasSuffix || maxSuffix > 0) {
+              primaryFieldValue = `${basePrimaryValue}-${maxSuffix + 1}`;
+              console.log(
+                `Creating new report with incremented primary field value: ${primaryFieldValue}`
+              );
+
+              // Update the content object to reflect the new primary field value
+              if (content && typeof content === "object") {
+                if (content.primaryField) {
+                  content.primaryField.value = primaryFieldValue;
+                } else if (
+                  content.selectedFieldValues &&
+                  content.primaryIdentifierField
+                ) {
+                  // Update in the old format as well if needed
+                  const fieldName = content.primaryIdentifierField;
+                  if (content.selectedFieldValues[fieldName]) {
+                    if (
+                      typeof content.selectedFieldValues[fieldName] === "object"
+                    ) {
+                      content.selectedFieldValues[fieldName].value =
+                        primaryFieldValue;
+                    } else {
+                      content.selectedFieldValues[fieldName] =
+                        primaryFieldValue;
+                    }
+                  }
+                }
+              }
+            }
+          }
+        }
+
+        // Always create a new report (with incremented suffix if needed)
+        console.log(
+          "Creating new report with primary field value:",
+          primaryFieldValue
+        );
+        const [result] = await connection.query(
+          `INSERT INTO ${clientReportsTable} 
+           (client_id, template_name, primary_field_name, primary_field_value, colors, content, status, created_by, updated_by) 
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+          [
+            client_id,
+            template_name,
+            primaryFieldName,
+            primaryFieldValue,
+            JSON.stringify(colors || {}),
+            JSON.stringify(content || {}),
+            reportStatus,
+            user_id,
+            user_id,
+          ]
+        );
+        return res.status(201).json({
+          success: true,
+          message: `Report saved successfully to ${clientReportsTable}`,
+          data: {
+            id: result.insertId,
+            table: clientReportsTable,
+            primary_field: {
+              name: primaryFieldName,
+              value: primaryFieldValue,
+            },
+          },
+        });
+      }
+    } finally {
+      connection.release();
+    }
+  } catch (error) {
+    console.error("Error saving report:", error);
+    return res.status(500).json({
+      error: "Failed to save report",
+      details: error.message,
+    });
+  }
+};
+
+/**
+ * Fetch reports for a client
+ * @param {Object} req - Request object
+ * @param {Object} res - Response object
+ */
+const getReports = async (req, res) => {
+  try {
+    const { client_id } = req.params;
+    const { user_id } = req.query; // Get user_id from query parameters
+
+    if (!client_id) {
+      return res.status(400).json({
+        error: "Client ID is required",
+      });
+    }
+
+    const connection = await db.getConnection();
+
+    try {
+      // First, get the client name for the table name - try by both id and uuid
+      console.log("Looking for client with ID or UUID:", client_id);
+
+      // First try with id
+      let [clientResult] = await connection.query(
+        "SELECT name FROM clients WHERE id = ?",
+        [client_id]
+      );
+
+      // If not found, try with uuid
+      if (clientResult.length === 0) {
+        console.log("Client not found by id, trying with uuid");
+        [clientResult] = await connection.query(
+          "SELECT name FROM clients WHERE uuid = ?",
+          [client_id]
+        );
+
+        // If still not found, return 404
+        if (clientResult.length === 0) {
+          return res.status(404).json({
+            error: "Client not found",
+          });
+        }
+      }
+
+      // Format client name to be used in table name
+      const clientName = clientResult[0].name
+        .replace(/\s+/g, "_")
+        .replace(/[^a-zA-Z0-9_]/g, "")
+        .toLowerCase();
+
+      // Define the client-specific reports table name
+      const clientReportsTable = `${clientName}_reports`;
+      console.log("Using client reports table:", clientReportsTable);
+
+      // Check if the client-specific table exists
+      const [tableExists] = await connection.query(
+        "SELECT COUNT(*) as count FROM information_schema.tables WHERE table_schema = DATABASE() AND table_name = ?",
+        [clientReportsTable]
+      );
+
+      // If table doesn't exist yet, return empty array
+      if (tableExists[0].count === 0) {
+        return res.status(200).json({
+          success: true,
+          data: [],
+          message: "No reports table exists for this client yet",
+        });
+      }
+
+      // Check if the table has the new dynamic primary field columns
+      const [columnsCheck] = await connection.query(
+        `
+        SELECT 
+          COUNT(*) as count 
+        FROM information_schema.columns 
+        WHERE 
+          table_schema = DATABASE() 
+          AND table_name = ? 
+          AND column_name IN ('primary_field_name', 'primary_field_value')
+      `,
+        [clientReportsTable]
+      );
+
+      // Build the WHERE clause based on provided filters
+      let whereClause = "r.client_id = ?";
+      let queryParams = [client_id];
+
+      // Add user_id filter if provided
+      if (user_id) {
+        whereClause += " AND r.created_by = ?";
+        queryParams.push(user_id);
+        console.log(`Filtering reports for user ID: ${user_id}`);
+      }
+
+      // Query the client-specific table, including dynamic primary field if available
+      let reports;
+      if (columnsCheck[0].count === 2) {
+        // Join with users table to get creator information
+        [reports] = await connection.query(
+          `SELECT r.*, r.primary_field_name, r.primary_field_value, 
+            c.name as creator_name, c.uuid as creator_uuid,
+            u.name as updater_name, u.uuid as updater_uuid
+          FROM ${clientReportsTable} r
+          LEFT JOIN users c ON r.created_by = c.id
+          LEFT JOIN users u ON r.updated_by = u.id
+          WHERE ${whereClause}
+          ORDER BY r.created_at DESC`,
+          queryParams
+        );
+      } else {
+        // Fallback to original query if columns don't exist yet, but still include user information
+        [reports] = await connection.query(
+          `SELECT r.*, 
+            c.name as creator_name, c.uuid as creator_uuid,
+            u.name as updater_name, u.uuid as updater_uuid
+          FROM ${clientReportsTable} r
+          LEFT JOIN users c ON r.created_by = c.id 
+          LEFT JOIN users u ON r.updated_by = u.id
+          WHERE ${whereClause}
+          ORDER BY r.created_at DESC`,
+          queryParams
+        );
+      }
+
+      // Parse JSON fields
+      const formattedReports = reports.map((report) => {
+        try {
+          // Handle colors field
+          let parsedColors = {};
+          if (report.colors) {
+            if (typeof report.colors === "object") {
+              parsedColors = report.colors;
+            } else {
+              parsedColors = JSON.parse(report.colors);
+            }
+          }
+
+          // Handle content field
+          let parsedContent = {};
+          if (report.content) {
+            if (typeof report.content === "object") {
+              parsedContent = report.content;
+            } else {
+              parsedContent = JSON.parse(report.content);
+            }
+          }
+
+          // Create primary field information
+          const primaryField = {
+            name: report.primary_field_name || "branch_code",
+            value: report.primary_field_value || null,
+          };
+
+          // Add creator and updater info
+          const creator = {
+            id: report.created_by,
+            name: report.creator_name || "Unknown",
+            uuid: report.creator_uuid || null,
+          };
+
+          const updater = {
+            id: report.updated_by,
+            name: report.updater_name || "Unknown",
+            uuid: report.updater_uuid || null,
+          };
+
+          return {
+            ...report,
+            colors: parsedColors,
+            content: parsedContent,
+            table: clientReportsTable,
+            primary_field: primaryField,
+            creator,
+            updater,
+          };
+        } catch (parseError) {
+          console.error(
+            `Error parsing JSON for report ${report.id}:`,
+            parseError
+          );
+          return {
+            ...report,
+            colors: {},
+            content: {},
+            table: clientReportsTable,
+            primary_field: {
+              name: report.primary_field_name || "branch_code",
+              value: report.primary_field_value || null,
+            },
+            creator: {
+              id: report.created_by,
+              name: report.creator_name || "Unknown",
+              uuid: report.creator_uuid || null,
+            },
+            updater: {
+              id: report.updated_by,
+              name: report.updater_name || "Unknown",
+              uuid: report.updater_uuid || null,
+            },
+          };
+        }
+      });
+
+      return res.status(200).json({
+        success: true,
+        data: formattedReports,
+      });
+    } finally {
+      connection.release();
+    }
+  } catch (error) {
+    console.error("Error fetching reports:", error);
+    return res.status(500).json({
+      error: "Failed to fetch reports",
+      details: error.message,
+    });
+  }
+};
+
+/**
+ * Fetch a specific report by ID
+ * @param {Object} req - Request object
+ * @param {Object} res - Response object
+ */
+const getReportById = async (req, res) => {
+  try {
+    const { id } = req.params;
+    const { client_id, table } = req.query;
+
+    if (!id) {
+      return res.status(400).json({
+        error: "Report ID is required",
+      });
+    }
+
+    // Either client_id or table must be provided
+    if (!client_id && !table) {
+      return res.status(400).json({
+        error: "Either client_id or table name is required",
+      });
+    }
+
+    const connection = await db.getConnection();
+
+    try {
+      let clientReportsTable;
+
+      // If table name is provided directly, use it
+      if (table) {
+        clientReportsTable = table;
+      }
+      // Otherwise, derive it from client_id
+      else {
+        // Get client name - try both id and uuid
+        console.log("Looking for client with ID or UUID:", client_id);
+
+        // First try with id
+        let [clientResult] = await connection.query(
+          "SELECT name FROM clients WHERE id = ?",
+          [client_id]
+        );
+
+        // If not found, try with uuid
+        if (clientResult.length === 0) {
+          console.log("Client not found by id, trying with uuid");
+          [clientResult] = await connection.query(
+            "SELECT name FROM clients WHERE uuid = ?",
+            [client_id]
+          );
+
+          // If still not found, return 404
+          if (clientResult.length === 0) {
+            return res.status(404).json({
+              error: "Client not found",
+            });
+          }
+        }
+
+        // Format client name for table name
+        const clientName = clientResult[0].name
+          .replace(/\s+/g, "_")
+          .replace(/[^a-zA-Z0-9_]/g, "")
+          .toLowerCase();
+
+        clientReportsTable = `${clientName}_reports`;
+        console.log("Using client reports table:", clientReportsTable);
+      }
+
+      // Check if the table exists
+      const [tableExists] = await connection.query(
+        "SELECT COUNT(*) as count FROM information_schema.tables WHERE table_schema = DATABASE() AND table_name = ?",
+        [clientReportsTable]
+      );
+
+      if (tableExists[0].count === 0) {
+        return res.status(404).json({
+          error: `Report table ${clientReportsTable} does not exist`,
+        });
+      }
+
+      // Check if the table has the new dynamic primary field columns
+      const [columnsCheck] = await connection.query(
+        `
+        SELECT 
+          COUNT(*) as count 
+        FROM information_schema.columns 
+        WHERE 
+          table_schema = DATABASE() 
+          AND table_name = ? 
+          AND column_name IN ('primary_field_name', 'primary_field_value')
+      `,
+        [clientReportsTable]
+      );
+
+      // Query the specific report with user information
+      let reports;
+      if (columnsCheck[0].count === 2) {
+        [reports] = await connection.query(
+          `SELECT r.*, r.primary_field_name, r.primary_field_value, 
+            c.name as creator_name, c.uuid as creator_uuid,
+            u.name as updater_name, u.uuid as updater_uuid
+          FROM ${clientReportsTable} r
+          LEFT JOIN users c ON r.created_by = c.id
+          LEFT JOIN users u ON r.updated_by = u.id
+          WHERE r.id = ?`,
+          [id]
+        );
+      } else {
+        // Fallback to original query if columns don't exist yet, but still include user information
+        [reports] = await connection.query(
+          `SELECT r.*, 
+            c.name as creator_name, c.uuid as creator_uuid,
+            u.name as updater_name, u.uuid as updater_uuid
+          FROM ${clientReportsTable} r
+          LEFT JOIN users c ON r.created_by = c.id
+          LEFT JOIN users u ON r.updated_by = u.id
+          WHERE r.id = ?`,
+          [id]
+        );
+      }
+
+      if (reports.length === 0) {
+        return res.status(404).json({
+          error: "Report not found",
+        });
+      }
+
+      // Parse JSON fields
+      try {
+        // Handle colors field
+        let parsedColors = {};
+        if (reports[0].colors) {
+          if (typeof reports[0].colors === "object") {
+            parsedColors = reports[0].colors;
+          } else {
+            parsedColors = JSON.parse(reports[0].colors);
+          }
+        }
+
+        // Handle content field
+        let parsedContent = {};
+        if (reports[0].content) {
+          if (typeof reports[0].content === "object") {
+            parsedContent = reports[0].content;
+          } else {
+            parsedContent = JSON.parse(reports[0].content);
+          }
+        }
+
+        // Create primary field information
+        const primaryField = {
+          name: reports[0].primary_field_name || "branch_code",
+          value: reports[0].primary_field_value || null,
+        };
+
+        // Add creator and updater info
+        const creator = {
+          id: reports[0].created_by,
+          name: reports[0].creator_name || "Unknown",
+          uuid: reports[0].creator_uuid || null,
+        };
+
+        const updater = {
+          id: reports[0].updated_by,
+          name: reports[0].updater_name || "Unknown",
+          uuid: reports[0].updater_uuid || null,
+        };
+
+        return res.status(200).json({
+          success: true,
+          data: {
+            ...reports[0],
+            colors: parsedColors,
+            content: parsedContent,
+            table: clientReportsTable,
+            primary_field: primaryField,
+            creator,
+            updater,
+          },
+        });
+      } catch (parseError) {
+        console.error(
+          `Error parsing JSON for report ${reports[0].id}:`,
+          parseError
+        );
+        return res.status(200).json({
+          success: true,
+          data: {
+            ...reports[0],
+            colors: {},
+            content: {},
+            table: clientReportsTable,
+            primary_field: {
+              name: reports[0].primary_field_name || "branch_code",
+              value: reports[0].primary_field_value || null,
+            },
+            creator: {
+              id: reports[0].created_by,
+              name: reports[0].creator_name || "Unknown",
+              uuid: reports[0].creator_uuid || null,
+            },
+            updater: {
+              id: reports[0].updated_by,
+              name: reports[0].updater_name || "Unknown",
+              uuid: reports[0].updater_uuid || null,
+            },
+          },
+        });
+      }
+    } finally {
+      connection.release();
+    }
+  } catch (error) {
+    console.error("Error fetching report:", error);
+    return res.status(500).json({
+      error: "Failed to fetch report",
+      details: error.message,
+    });
+  }
+};
+
+/**
+ * Delete a report
+ * @param {Object} req - Request object
+ * @param {Object} res - Response object
+ */
+const deleteReport = async (req, res) => {
+  try {
+    const { id } = req.params;
+    const { client_id, table } = req.query;
+
+    if (!id) {
+      return res.status(400).json({
+        error: "Report ID is required",
+      });
+    }
+
+    // Either client_id or table must be provided
+    if (!client_id && !table) {
+      return res.status(400).json({
+        error: "Either client_id or table name is required",
+      });
+    }
+
+    const connection = await db.getConnection();
+
+    try {
+      let clientReportsTable;
+
+      // If table name is provided directly, use it
+      if (table) {
+        clientReportsTable = table;
+      }
+      // Otherwise, derive it from client_id
+      else {
+        // Get client name - try both id and uuid
+        console.log("Looking for client with ID or UUID:", client_id);
+
+        // First try with id
+        let [clientResult] = await connection.query(
+          "SELECT name FROM clients WHERE id = ?",
+          [client_id]
+        );
+
+        // If not found, try with uuid
+        if (clientResult.length === 0) {
+          console.log("Client not found by id, trying with uuid");
+          [clientResult] = await connection.query(
+            "SELECT name FROM clients WHERE uuid = ?",
+            [client_id]
+          );
+
+          // If still not found, return 404
+          if (clientResult.length === 0) {
+            return res.status(404).json({
+              error: "Client not found",
+            });
+          }
+        }
+
+        // Format client name for table name
+        const clientName = clientResult[0].name
+          .replace(/\s+/g, "_")
+          .replace(/[^a-zA-Z0-9_]/g, "")
+          .toLowerCase();
+
+        clientReportsTable = `${clientName}_reports`;
+        console.log("Using client reports table:", clientReportsTable);
+      }
+
+      // Check if the table exists
+      const [tableExists] = await connection.query(
+        "SELECT COUNT(*) as count FROM information_schema.tables WHERE table_schema = DATABASE() AND table_name = ?",
+        [clientReportsTable]
+      );
+
+      if (tableExists[0].count === 0) {
+        return res.status(404).json({
+          error: `Report table ${clientReportsTable} does not exist`,
+        });
+      }
+
+      // Check if report exists
+      const [report] = await connection.query(
+        `SELECT id FROM ${clientReportsTable} WHERE id = ?`,
+        [id]
+      );
+
+      if (report.length === 0) {
+        return res.status(404).json({
+          error: "Report not found",
+        });
+      }
+
+      // Delete the report
+      await connection.query(`
