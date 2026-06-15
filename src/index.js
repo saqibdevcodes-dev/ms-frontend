@@ -35,6 +35,8 @@ try {
 const allowedOrigins = [
   "http://localhost:5173",
   "https://ms.iriscommunications.cloud",
+  "https://mss.iriscommunications.cloud",
+  "https://ms-front-mu.vercel.app",
   "https://ms-frontend-test-9b21.vercel.app", // Fixed: removed trailing slash
 ];
 

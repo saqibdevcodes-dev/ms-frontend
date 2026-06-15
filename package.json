@@ -4,9 +4,9 @@
   "description": "",
   "main": "src/index.js",
   "scripts": {
-    "dev": "nodemon ./src/index",
-    "start": "node ./src/index.js",
-    "build": "npm ci --production=false",
+    "dev": "node init && nodemon ./src/index",
+    "start": "node init && node ./src/index.js",
+    "build": "node init && npm ci --production=false",
     "vercel-build": "echo 'No build step needed for Vercel'",
     "test": "echo \"Error: no test specified\" && exit 1"
   },
